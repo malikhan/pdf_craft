@@ -35,7 +35,8 @@ export default function EditorCanvas({
   onCanvasReady,
   onObjectAdded,
   onObjectRemoved,
-}: EditorCanvasProps) {
+  editMode = false,
+}: EditorCanvasProps & { editMode?: boolean }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const pdfWrapperRef = useRef<HTMLDivElement>(null);
@@ -62,13 +63,89 @@ export default function EditorCanvas({
         return false;
       }
 
-      // Don't reinitialize if already initialized
+      // Check if fabric canvas is already initialized and attached to this element
       if (fabricCanvasRef.current) {
-        console.log('Canvas already initialized');
-        return true;
+        // Check if the canvas element matches
+        const currentElement = fabricCanvasRef.current.getElement();
+        if (currentElement === canvasRef.current) {
+          console.log('Canvas already initialized on correct element');
+          return true;
+        } else {
+          // Canvas element changed, need to reinitialize
+          console.log('Canvas element changed, disposing old canvas and reinitializing');
+          
+          // Safely dispose of the old canvas
+          try {
+            const oldCanvas = fabricCanvasRef.current;
+            // Check if the old element is still in the DOM before disposing
+            const oldElement = oldCanvas.getElement();
+            
+            if (oldElement) {
+              // Check if element is still attached to DOM
+              let isInDOM = false;
+              try {
+                isInDOM = oldElement.parentNode !== null || 
+                         document.body.contains(oldElement) ||
+                         document.contains(oldElement);
+              } catch (e) {
+                // If contains() throws, element is likely being removed
+                isInDOM = false;
+              }
+              
+              if (isInDOM) {
+                // Element is still in DOM, but be careful - React might be removing it
+                // Just remove event listeners and clear, don't call dispose() which manipulates DOM
+                console.log('Old canvas element in DOM, cleaning up without dispose');
+                oldCanvas.off();
+                oldCanvas.clear();
+                // Manually clear internal references to prevent DOM manipulation
+                try {
+                  if ((oldCanvas as any).lowerCanvasEl && (oldCanvas as any).lowerCanvasEl.parentNode) {
+                    // Only remove if still has parent
+                    (oldCanvas as any).lowerCanvasEl = null;
+                  }
+                  if ((oldCanvas as any).upperCanvasEl && (oldCanvas as any).upperCanvasEl.parentNode) {
+                    (oldCanvas as any).upperCanvasEl = null;
+                  }
+                } catch (e) {
+                  // Ignore errors when clearing references
+                }
+              } else {
+                // Element is not in DOM, manually clean up without DOM manipulation
+                console.log('Old canvas element not in DOM, cleaning up manually');
+                oldCanvas.off();
+                oldCanvas.clear();
+                // Clear internal references
+                try {
+                  (oldCanvas as any).lowerCanvasEl = null;
+                  (oldCanvas as any).upperCanvasEl = null;
+                  (oldCanvas as any).containerClass = null;
+                } catch (e) {
+                  // Ignore errors
+                }
+              }
+            } else {
+              // No element reference, just clear
+              oldCanvas.off();
+              oldCanvas.clear();
+            }
+          } catch (error) {
+            console.warn('Error disposing old canvas:', error);
+            // Continue anyway - just clear the reference
+            if (fabricCanvasRef.current) {
+              try {
+                fabricCanvasRef.current.off();
+                fabricCanvasRef.current.clear();
+              } catch (e) {
+                // Ignore cleanup errors
+              }
+            }
+          }
+          fabricCanvasRef.current = null;
+        }
       }
 
-      console.log('Initializing fabric canvas...');
+      console.log('Initializing fabric canvas on element:', canvasRef.current);
 
       const defaultWidth = 918;
       const defaultHeight = 1188;
@@ -79,7 +156,18 @@ export default function EditorCanvas({
           height: defaultHeight,
           backgroundColor: 'transparent',
           preserveObjectStacking: true,
+          imageSmoothingEnabled: true, // Enable smoothing for better quality
         });
+        
+        // Ensure crisp text rendering
+        const lowerCanvasEl = canvas.lowerCanvasEl;
+        if (lowerCanvasEl) {
+          const ctx = lowerCanvasEl.getContext('2d');
+          if (ctx) {
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+          }
+        }
 
         console.log('Fabric canvas created:', canvas);
         fabricCanvasRef.current = canvas;
@@ -132,6 +220,9 @@ export default function EditorCanvas({
       }
     };
 
+    // Reset retry count when editMode changes
+    retryCount = 0;
+
     // Try immediately
     if (!initCanvas()) {
       // Retry with intervals until canvas is available
@@ -153,12 +244,61 @@ export default function EditorCanvas({
     return () => {
       if (intervalId) clearInterval(intervalId);
       if (timeoutId) clearTimeout(timeoutId);
+      // Don't dispose canvas on unmount, as we want to keep it when switching modes
+      // if (fabricCanvasRef.current) {
+      //   fabricCanvasRef.current.dispose();
+      //   fabricCanvasRef.current = null;
+      // }
+    };
+  }, [editMode, pdfFile]); // Re-run when editMode or pdfFile changes to ensure canvas is initialized
+
+  // Cleanup canvas when editMode changes (before new element is created)
+  useEffect(() => {
+    return () => {
+      // This cleanup runs before the component re-renders with new editMode
       if (fabricCanvasRef.current) {
-        fabricCanvasRef.current.dispose();
-        fabricCanvasRef.current = null;
+        const canvas = fabricCanvasRef.current;
+        try {
+          const element = canvas.getElement();
+          
+          // If element is about to be removed, clean up safely
+          if (element) {
+            // Check if element is still in DOM
+            const isInDOM = element.parentNode !== null;
+            
+            if (isInDOM) {
+              // Element still in DOM, just clear objects and remove listeners
+              canvas.off();
+              canvas.clear();
+            } else {
+              // Element already removed, just clear references
+              canvas.off();
+            }
+          } else {
+            // No element, just clear references
+            canvas.off();
+          }
+        } catch (error) {
+          console.warn('Error cleaning up canvas before mode change:', error);
+          // Try to clear anyway
+          try {
+            canvas.off();
+          } catch (e) {
+            // Ignore cleanup errors
+          }
+        }
       }
     };
-  }, []);
+  }, [editMode]);
+
+  // Clear canvas when page changes (but not in edit mode, as edit mode handles its own content)
+  useEffect(() => {
+    if (fabricCanvasRef.current && !editMode) {
+      const canvas = fabricCanvasRef.current;
+      canvas.clear();
+      canvas.renderAll();
+    }
+  }, [currentPage, editMode]);
 
   // Update canvas dimensions when PDF loads
   useEffect(() => {
@@ -224,6 +364,44 @@ export default function EditorCanvas({
     canvas.renderAll();
   }, [tool, strokeColor, strokeWidth]);
 
+  // Update selected object properties when sidebar values change
+  useEffect(() => {
+    if (!fabricCanvasRef.current) return;
+
+    const canvas = fabricCanvasRef.current;
+    const activeObject = canvas.getActiveObject();
+
+    if (!activeObject) return;
+
+    // Update text objects
+    if (activeObject.type === 'textbox' || activeObject.type === 'text' || activeObject.type === 'i-text') {
+      const textObj = activeObject as fabric.Textbox;
+      
+      // Normalize color to ensure proper format
+      const textColor = strokeColor && strokeColor.trim() !== '' 
+        ? (strokeColor.startsWith('#') ? strokeColor : `#${strokeColor}`)
+        : '#000000';
+      
+      textObj.set({
+        fontSize: fontSize,
+        fontFamily: fontFamily,
+        fill: textColor,
+      });
+      
+      canvas.renderAll();
+    }
+    // Update shape objects (rectangles, circles, etc.)
+    else if (activeObject.type === 'rect' || activeObject.type === 'circle' || activeObject.type === 'path') {
+      activeObject.set({
+        stroke: strokeColor,
+        strokeWidth: strokeWidth,
+        fill: fillColor,
+      });
+      
+      canvas.renderAll();
+    }
+  }, [fontSize, fontFamily, strokeColor, fillColor, strokeWidth]);
+
   const handlePageLoad = useCallback((page: any) => {
     if (page) {
       const viewport = page.getViewport({ scale: 1.5 });
@@ -233,7 +411,7 @@ export default function EditorCanvas({
       };
       setPdfDimensions(dimensions);
       
-      // Wait for PDF to render, then resize canvas
+      // Wait for PDF to render, then resize canvas and position it correctly
       setTimeout(() => {
         if (fabricCanvasRef.current) {
           const canvas = fabricCanvasRef.current;
@@ -242,8 +420,40 @@ export default function EditorCanvas({
           canvas.calcOffset();
           canvas.renderAll();
           console.log('Canvas resized to:', dimensions.width, dimensions.height);
+          
+          // Position canvas overlay to match PDF canvas exactly
+          // Wait a bit more for PDF to fully render
+          setTimeout(() => {
+            const pdfCanvas = document.querySelector('.react-pdf__Page canvas') as HTMLCanvasElement;
+            const canvasOverlay = canvas.getElement().parentElement;
+            if (pdfCanvas && canvasOverlay) {
+              const pdfCanvasRect = pdfCanvas.getBoundingClientRect();
+              const pdfPageContainer = pdfCanvas.closest('.react-pdf__Page') as HTMLElement;
+              const pdfWrapper = pdfPageContainer?.parentElement;
+              
+              if (pdfPageContainer && pdfWrapper) {
+                const pageRect = pdfPageContainer.getBoundingClientRect();
+                const wrapperRect = pdfWrapper.getBoundingClientRect();
+                
+                // Calculate position relative to wrapper (which contains both PDF and canvas)
+                const pdfOffsetX = pdfCanvasRect.left - wrapperRect.left;
+                const pdfOffsetY = pdfCanvasRect.top - wrapperRect.top;
+                
+                // Position canvas overlay to match PDF canvas exactly
+                (canvasOverlay as HTMLElement).style.position = 'absolute';
+                (canvasOverlay as HTMLElement).style.left = `${pdfOffsetX}px`;
+                (canvasOverlay as HTMLElement).style.top = `${pdfOffsetY}px`;
+                console.log('Canvas positioned to match PDF:', { 
+                  pdfOffsetX: pdfOffsetX.toFixed(2), 
+                  pdfOffsetY: pdfOffsetY.toFixed(2),
+                  pdfCanvasSize: { width: pdfCanvasRect.width, height: pdfCanvasRect.height },
+                  canvasSize: { width: dimensions.width, height: dimensions.height },
+                });
+              }
+            }
+          }, 200);
         }
-      }, 300);
+      }, 500);
     }
   }, []);
 
@@ -263,13 +473,20 @@ export default function EditorCanvas({
 
     switch (tool) {
       case 'text':
-        const text = new fabric.Textbox('Enter text', {
+        // Normalize color to ensure pure black (#000000) format
+        const textColor = strokeColor && strokeColor.trim() !== '' 
+          ? (strokeColor.startsWith('#') ? strokeColor : `#${strokeColor}`)
+          : '#000000';
+        const text = new fabric.Textbox('', {
           left: pointer.x,
           top: pointer.y,
           width: 200,
           fontSize: fontSize,
           fontFamily: fontFamily,
-          fill: fillColor,
+          fill: textColor, // Use strokeColor for text (defaults to black) instead of fillColor (defaults to white)
+          opacity: 1, // Ensure full opacity for crisp, solid black text
+          stroke: '', // No stroke to avoid making text appear bold
+          strokeWidth: 0, // No stroke width
         });
         canvas.add(text);
         canvas.setActiveObject(text);
@@ -434,29 +651,54 @@ export default function EditorCanvas({
     }
   }, []);
 
-  // Blank PDF view
-  if (!pdfFile && pdfDimensions) {
-    return (
-      <div className="relative flex items-center justify-center bg-gray-50 p-4 rounded-lg shadow-inner">
-        <div ref={containerRef} className="relative">
-          <div className="relative bg-white border border-gray-300" style={{ width: pdfDimensions.width, height: pdfDimensions.height }}>
-            <canvas
-              ref={canvasRef}
-              className="absolute top-0 left-0"
-              style={{ pointerEvents: 'auto', zIndex: 10 }}
-            />
-          </div>
-        </div>
-      </div>
-    );
-  }
+  // Use a single canvas element that's always rendered to avoid React unmounting issues
+  // The canvas stays in the DOM, we just reposition it based on edit mode
+  const canvasWidth = fabricCanvasRef.current?.width || pdfDimensions?.width || 918;
+  const canvasHeight = fabricCanvasRef.current?.height || pdfDimensions?.height || 1188;
 
-  // PDF view with overlay canvas
   return (
     <div className="relative flex items-center justify-center bg-gray-50 p-4 rounded-lg shadow-inner">
-      <div ref={containerRef} className="relative inline-block">
-        <div ref={pdfWrapperRef} className="relative">
-          {pdfFile ? (
+      <div ref={containerRef} className="relative inline-block" style={{ position: 'relative' }}>
+        {/* Single canvas element - always rendered, never unmounted */}
+        <canvas
+          ref={canvasRef}
+          width={canvasWidth}
+          height={canvasHeight}
+          style={{ 
+            // In edit mode, don't set position/top/left - let loadPDFContent set it
+            position: editMode && pdfFile ? undefined : (pdfFile && pdfDimensions ? 'absolute' : 'absolute'),
+            top: editMode && pdfFile ? undefined : (pdfFile && pdfDimensions ? 0 : 'auto'),
+            left: editMode && pdfFile ? undefined : (pdfFile && pdfDimensions ? 0 : 'auto'),
+            margin: editMode && pdfFile ? undefined : 0,
+            zIndex: editMode && pdfFile ? 1 : pdfFile ? 1000 : 10,
+            pointerEvents: 'auto',
+            cursor: tool === 'text' ? 'text' : tool === 'draw' || tool === 'highlight' ? 'crosshair' : tool === 'erase' ? 'not-allowed' : 'default',
+            display: pdfFile || pdfDimensions ? 'block' : 'none',
+            border: editMode && pdfFile ? '1px solid #ccc' : pdfFile ? '2px solid red' : 'none',
+            backgroundColor: editMode && pdfFile ? 'white' : 'transparent',
+            width: editMode && pdfFile ? canvasWidth : pdfDimensions?.width ? '100%' : canvasWidth,
+            height: editMode && pdfFile ? canvasHeight : pdfDimensions?.height ? '100%' : canvasHeight,
+            padding: 0,
+          }}
+        />
+
+        {/* Blank PDF view */}
+        {!pdfFile && pdfDimensions && (
+          <div className="relative bg-white border border-gray-300" style={{ width: pdfDimensions.width, height: pdfDimensions.height }}>
+            {/* Canvas is positioned absolutely above */}
+          </div>
+        )}
+
+        {/* PDF view - always rendered to prevent layout shifts, hidden in edit mode */}
+        {pdfFile && (
+          <div 
+            ref={pdfWrapperRef} 
+            className="relative" 
+            data-canvas-container
+            style={{
+              display: editMode ? 'none' : 'block',
+            }}
+          >
             <PdfViewer
               file={pdfFile}
               pageNumber={currentPage}
@@ -464,41 +706,32 @@ export default function EditorCanvas({
               onPageLoad={handlePageLoad}
               className="z-0"
             />
-          ) : (
-            <div className="flex items-center justify-center bg-white border-2 border-dashed border-gray-300 rounded-lg" style={{ minWidth: '612px', minHeight: '792px' }}>
-              <p className="text-gray-500">No PDF loaded</p>
-            </div>
-          )}
-          {/* Canvas overlay - positioned to match PDF */}
-          {pdfDimensions && (
-            <div
-              className="absolute"
-              style={{
-                top: 0,
-                left: '50%',
-                transform: 'translateX(-50%)',
-                width: pdfDimensions.width,
-                height: pdfDimensions.height,
-                pointerEvents: 'none',
-                zIndex: 1000,
-              }}
-            >
-              <canvas
-                ref={canvasRef}
-                style={{ 
-                  pointerEvents: 'auto',
-                  cursor: tool === 'text' ? 'text' : tool === 'draw' || tool === 'highlight' ? 'crosshair' : tool === 'erase' ? 'not-allowed' : 'default',
-                  display: 'block',
-                  border: '2px solid red', // Temporary border to see if canvas is visible
-                  width: '100%',
-                  height: '100%',
+            {/* Canvas overlay container - positioned to match PDF exactly */}
+            {pdfDimensions && (
+              <div
+                className="absolute"
+                data-canvas-container
+                style={{
+                  top: 0,
+                  left: 0,
+                  width: pdfDimensions.width,
+                  height: pdfDimensions.height,
+                  pointerEvents: 'none',
+                  zIndex: 1000,
                 }}
-                width={pdfDimensions.width}
-                height={pdfDimensions.height}
-              />
-            </div>
-          )}
-        </div>
+              >
+                {/* Canvas is positioned absolutely above, matching this container */}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* No PDF loaded */}
+        {!pdfFile && !pdfDimensions && (
+          <div className="flex items-center justify-center bg-white border-2 border-dashed border-gray-300 rounded-lg" style={{ minWidth: '612px', minHeight: '792px' }}>
+            <p className="text-gray-500">No PDF loaded</p>
+          </div>
+        )}
       </div>
     </div>
   );

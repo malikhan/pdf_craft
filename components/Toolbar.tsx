@@ -15,6 +15,7 @@ import {
   ArrowRight,
   FilePlus,
   MousePointer2,
+  Edit,
 } from 'lucide-react';
 import { Button } from './ui/button';
 import { cn } from '@/lib/utils';
@@ -28,9 +29,11 @@ interface ToolbarProps {
   onRedo: () => void;
   onNewPDF: () => void;
   onAddImage: () => void;
+  onEditMode: () => void;
   canUndo: boolean;
   canRedo: boolean;
   hasPdf: boolean;
+  editMode: boolean;
 }
 
 export default function Toolbar({
@@ -42,14 +45,17 @@ export default function Toolbar({
   onRedo,
   onNewPDF,
   onAddImage,
+  onEditMode,
   canUndo,
   canRedo,
   hasPdf,
+  editMode,
 }: ToolbarProps) {
   const tools = [
     { id: 'select', label: 'Select', icon: MousePointer2, disabled: false },
     { id: 'upload', label: 'Upload', icon: Upload, action: onUpload },
     { id: 'new', label: 'New PDF', icon: FilePlus, action: onNewPDF },
+    { id: 'edit', label: editMode ? 'Exit Edit' : 'Edit PDF', icon: Edit, action: onEditMode, disabled: !hasPdf },
     { id: 'text', label: 'Add Text', icon: Type, disabled: !hasPdf },
     { id: 'image', label: 'Add Image', icon: ImageIcon, action: onAddImage, disabled: !hasPdf },
     { id: 'rectangle', label: 'Rectangle', icon: Square, disabled: !hasPdf },

@@ -77,7 +77,7 @@ export default function PdfViewer({
         <Page
           pageNumber={pageNumber}
           scale={scale}
-          renderTextLayer={false}
+          renderTextLayer={true}
           renderAnnotationLayer={false}
           onLoadSuccess={onPageLoad}
           className="shadow-lg"
