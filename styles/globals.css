@@ -58,3 +58,15 @@
   }
 }
 
+/* Hide scrollbars for editable text elements in PDF editor */
+.pdf-editable-text {
+  -ms-overflow-style: none; /* IE and Edge */
+  scrollbar-width: none; /* Firefox */
+}
+
+.pdf-editable-text::-webkit-scrollbar {
+  display: none; /* Chrome, Safari, Opera */
+  width: 0;
+  height: 0;
+}
+

@@ -17,6 +17,7 @@ interface PdfViewerProps {
   scale?: number;
   onPageLoad?: (page: any) => void;
   className?: string;
+  renderTextLayer?: boolean;
 }
 
 export default function PdfViewer({
@@ -25,6 +26,7 @@ export default function PdfViewer({
   scale = 1.5,
   onPageLoad,
   className = '',
+  renderTextLayer = false,
 }: PdfViewerProps) {
   const [numPages, setNumPages] = useState<number>(0);
   const [loading, setLoading] = useState(true);
@@ -77,7 +79,7 @@ export default function PdfViewer({
         <Page
           pageNumber={pageNumber}
           scale={scale}
-          renderTextLayer={true}
+          renderTextLayer={renderTextLayer}
           renderAnnotationLayer={false}
           onLoadSuccess={onPageLoad}
           className="shadow-lg"

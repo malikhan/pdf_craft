@@ -5,6 +5,7 @@ import { PDFDocument, rgb } from 'pdf-lib';
 import Toolbar from '@/components/Toolbar';
 import EditorCanvas from '@/components/EditorCanvas';
 import PdfTextEditor from '@/components/PdfTextEditor';
+import PdfTextEditorClean from '@/components/PdfTextEditorClean';
 import FileUpload from '@/components/FileUpload';
 import Sidebar from '@/components/Sidebar';
 import { loadPDF, createBlankPDF, savePDF, downloadPDF, applyFabricToPDF, clearAndRedrawPDFPage } from '@/lib/pdfUtils';
@@ -27,7 +28,19 @@ export default function Home() {
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [editMode, setEditMode] = useState(false);
-  const [editedTexts, setEditedTexts] = useState<Array<{ text: string; x: number; y: number; fontSize: number; fontFamily: string }>>([]);
+  const [editedTexts, setEditedTexts] = useState<Array<{ 
+    text: string; 
+    x: number; 
+    y: number; 
+    width: number;
+    height: number;
+    fontSize: number; 
+    fontFamily: string;
+    fontWeight?: string;
+    fontStyle?: string;
+    originalText?: string;
+  }>>([]);
+  const [pdfPageDimensions, setPdfPageDimensions] = useState<{ width: number; height: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileSelect = async (file: File) => {
@@ -72,26 +85,75 @@ export default function Home() {
   };
 
   const handleSave = async () => {
-    if (!pdfDoc) {
+    if (!pdfDoc || !pdfFile) {
       alert('No PDF loaded');
       return;
     }
 
     try {
       if (editMode && editedTexts.length > 0) {
-        // Save edited texts from contentEditable divs
-        await applyEditedTextsToPDF(pdfDoc, currentPage - 1, editedTexts);
-      } else if (canvasInstance) {
-        // Save canvas content (for non-edit mode)
-        await clearAndRedrawPDFPage(pdfDoc, currentPage - 1, canvasInstance);
-      }
+        // Use server-side cover+redraw approach
+        // Convert PDF to base64 (handle large files)
+        const pdfBytes = await pdfDoc.save();
+        // Convert Uint8Array to base64 safely (browser-compatible)
+        const uint8Array = new Uint8Array(pdfBytes);
+        let binary = '';
+        const len = uint8Array.byteLength;
+        for (let i = 0; i < len; i++) {
+          binary += String.fromCharCode(uint8Array[i]);
+        }
+        const base64 = btoa(binary);
+        
+        // Send to server for editing
+        const response = await fetch('/api/edit-pdf', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            pdfData: base64,
+            pageNumber: currentPage,
+            editedTexts: editedTexts,
+            pdfPageDimensions: pdfPageDimensions,
+            filename: 'edited.pdf',
+          }),
+        });
 
-      // Save and download
-      const blob = await savePDF(pdfDoc);
-      downloadPDF(blob, 'edited.pdf');
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.error || 'Failed to edit PDF');
+        }
+
+        const result = await response.json();
+        
+        // Download the edited PDF
+        const binaryString = atob(result.pdfData);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        const blob = new Blob([bytes], { type: 'application/pdf' });
+        downloadPDF(blob, result.filename || 'edited.pdf');
+        
+        // Reload the edited PDF
+        const newDoc = await PDFDocument.load(bytes);
+        setPdfDoc(newDoc);
+        const fileBlob = new Blob([bytes], { type: 'application/pdf' });
+        const arrayBuffer = await fileBlob.arrayBuffer();
+        setPdfFile(arrayBuffer);
+      } else if (canvasInstance) {
+        // Save canvas content (for non-edit mode) - keep existing client-side approach
+        await clearAndRedrawPDFPage(pdfDoc, currentPage - 1, canvasInstance);
+        const blob = await savePDF(pdfDoc);
+        downloadPDF(blob, 'edited.pdf');
+      } else {
+        // Just save the PDF as-is
+        const blob = await savePDF(pdfDoc);
+        downloadPDF(blob, 'edited.pdf');
+      }
     } catch (error) {
       console.error('Error saving PDF:', error);
-      alert('Failed to save PDF');
+      alert(`Failed to save PDF: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   };
 
@@ -946,9 +1008,31 @@ export default function Home() {
     }
   };
 
-  const handleTextChange = (texts: Array<{ text: string; x: number; y: number; fontSize: number; fontFamily: string }>) => {
+  const handleTextChange = (texts: Array<{ 
+    text: string; 
+    x: number; 
+    y: number; 
+    width: number;
+    height: number;
+    fontSize: number; 
+    fontFamily: string;
+    fontWeight?: string;
+    fontStyle?: string;
+    originalText?: string;
+  }>) => {
     setEditedTexts(texts);
   };
+  
+  // Get PDF page dimensions for coordinate conversion
+  useEffect(() => {
+    if (editMode && pdfFile) {
+      const pdfPage = document.querySelector('.react-pdf__Page');
+      if (pdfPage) {
+        const rect = pdfPage.getBoundingClientRect();
+        setPdfPageDimensions({ width: rect.width, height: rect.height });
+      }
+    }
+  }, [editMode, pdfFile, currentPage]);
 
   // Reload content when page changes in edit mode
   useEffect(() => {
@@ -1005,10 +1089,28 @@ export default function Home() {
           ) : (
             <div className="w-full max-w-5xl">
               {editMode ? (
-                <PdfTextEditor
+                <PdfTextEditorClean
                   pdfFile={pdfFile}
                   currentPage={currentPage}
-                  onTextChange={handleTextChange}
+                  onTextChange={(elements) => {
+                    // Convert to the format expected by handleTextChange
+                    const formattedTexts = elements.map(el => ({
+                      text: el.text,
+                      x: el.x,
+                      y: el.y,
+                      width: el.width,
+                      height: el.height,
+                      fontSize: el.fontSize,
+                      fontFamily: el.fontFamily,
+                      fontWeight: el.fontWeight,
+                      fontStyle: el.fontStyle,
+                      originalText: el.originalText,
+                    }));
+                    setEditedTexts(formattedTexts);
+                    setPdfPageDimensions({ width: elements[0]?.pageWidth || 612, height: elements[0]?.pageHeight || 792 });
+                  }}
+                  pageWidth={pdfPageDimensions?.width || 612}
+                  pageHeight={pdfPageDimensions?.height || 792}
                 />
               ) : (
                 <EditorCanvas
