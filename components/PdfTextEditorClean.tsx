@@ -86,12 +86,21 @@ export default function PdfTextEditorClean({
     }
   }, []);
 
-  // Inject CSS to hide scrollbars on textarea elements
+  // Inject CSS to hide scrollbars and ensure transparent backgrounds on textarea elements
   useEffect(() => {
     const style = document.createElement('style');
     style.textContent = `
       .pdf-text-editor textarea::-webkit-scrollbar {
         display: none;
+      }
+      .pdf-text-editor textarea {
+        background-color: transparent !important;
+        -webkit-appearance: none;
+        -moz-appearance: textfield;
+        appearance: none;
+      }
+      .pdf-text-editor textarea:not(:focus) {
+        background-color: transparent !important;
       }
     `;
     document.head.appendChild(style);
@@ -361,16 +370,32 @@ export default function PdfTextEditorClean({
             console.log(`Covering ${elements.length} text areas with background-colored rectangles...`);
             
             for (const element of elements) {
-              // Use white to cover text by default - this ensures original text is hidden
-              // Only use a specific color if it's explicitly set in CSS styles (not from canvas sampling)
+              // Sample the background color from the rendered canvas at the text position
+              // This ensures we use the actual background color from the PDF, not just CSS
               let coverColor = '#ffffff'; // Default to white
               
-              // Only use extracted background color if it's from CSS styles (not canvas sampling)
-              // Canvas sampling is disabled, so any backgroundColor here is from CSS
-              if (element.backgroundColor && 
+              // Try to sample the actual background color from the canvas
+              // Sample a few pixels around the text area to get the background
+              const sampleX = Math.max(0, Math.min(element.x - 5, renderCanvas.width - 1));
+              const sampleY = Math.max(0, Math.min(element.y - 5, renderCanvas.height - 1));
+              const imageData = renderContext.getImageData(sampleX, sampleY, 1, 1);
+              
+              if (imageData && imageData.data.length >= 4) {
+                const r = imageData.data[0];
+                const g = imageData.data[1];
+                const b = imageData.data[2];
+                const a = imageData.data[3] / 255;
+                
+                // Use sampled color if it's not too dark (likely background, not text)
+                if (r + g + b > 200) {
+                  coverColor = `rgb(${r}, ${g}, ${b})`;
+                }
+              }
+              
+              // Fallback to extracted background color from CSS if available
+              if (coverColor === '#ffffff' && element.backgroundColor && 
                   !element.backgroundColor.includes('transparent') &&
                   element.backgroundColor !== 'rgba(0, 0, 0, 0)') {
-                // Validate it's a reasonable background color (not dark text color)
                 const rgbMatch = element.backgroundColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
                 if (rgbMatch) {
                   const r = parseInt(rgbMatch[1]);
@@ -378,9 +403,7 @@ export default function PdfTextEditorClean({
                   const b = parseInt(rgbMatch[3]);
                   
                   // Only use if it's a light/colored background (not dark text)
-                  // This preserves pink boxes, yellow highlights, etc. from CSS
-                  if (r + g + b > 300) { // Light enough to be a background
-                    // Convert to RGB format for canvas
+                  if (r + g + b > 300) {
                     if (element.backgroundColor.startsWith('rgb')) {
                       coverColor = element.backgroundColor.replace('rgba', 'rgb').replace(/,\s*[\d.]+\s*\)/, ')');
                     } else if (element.backgroundColor.startsWith('#')) {
@@ -390,14 +413,14 @@ export default function PdfTextEditorClean({
                 }
               }
               
-              // Draw white rectangle to cover the original text
+              // Draw rectangle to cover the original text with the sampled/calculated background color
               renderContext.fillStyle = coverColor;
-              const padding = 2;
+              const padding = 3; // Slightly more padding to ensure full coverage
               renderContext.fillRect(
-                element.x - padding,
-                element.y - padding,
-                element.width + (padding * 2),
-                element.height + (padding * 2)
+                Math.max(0, element.x - padding),
+                Math.max(0, element.y - padding),
+                Math.min(element.width + (padding * 2), renderCanvas.width - (element.x - padding)),
+                Math.min(element.height + (padding * 2), renderCanvas.height - (element.y - padding))
               );
             }
             
@@ -828,14 +851,14 @@ export default function PdfTextEditorClean({
       }
     };
 
-    // Smart paragraph grouping using intelligent heuristics
+    // Smart paragraph grouping - balanced approach
     const groupTextItems = (items: TextElement[]): TextElement[] => {
       if (items.length === 0) return [];
       
       // Sort items by reading order: top to bottom, left to right
       const sorted = [...items].sort((a, b) => {
         const yDiff = a.y - b.y;
-        if (Math.abs(yDiff) > 2) return yDiff; // Different lines
+        if (Math.abs(yDiff) > 5) return yDiff; // Different lines if >5px apart
         return a.x - b.x; // Same line, sort by X
       });
 
@@ -843,16 +866,17 @@ export default function PdfTextEditorClean({
       const lines: TextElement[][] = [];
       let currentLine: TextElement[] = [sorted[0]];
       
+      const avgFontSize = sorted.reduce((sum, e) => sum + e.fontSize, 0) / sorted.length;
+      const lineThreshold = Math.max(avgFontSize * 0.4, 8); // 40% of font size or 8px
+      
       for (let i = 1; i < sorted.length; i++) {
         const prev = sorted[i - 1];
         const curr = sorted[i];
         const yDiff = Math.abs(prev.y - curr.y);
         
-        // Same line if Y difference is small (within 2px)
-        if (yDiff < 2) {
+        if (yDiff < lineThreshold) {
           currentLine.push(curr);
         } else {
-          // New line
           lines.push(currentLine);
           currentLine = [curr];
         }
@@ -860,13 +884,13 @@ export default function PdfTextEditorClean({
       if (currentLine.length > 0) {
         lines.push(currentLine);
       }
-
+      
       // Now group lines into paragraphs
       const paragraphs: TextElement[][] = [];
       let currentParagraph: TextElement[] = [...lines[0]];
       
-      // Calculate typical line spacing from first few lines to establish baseline
-      let typicalLineSpacing = 0;
+      // Calculate typical line spacing
+      let typicalLineSpacing = avgFontSize * 1.5;
       if (lines.length > 1) {
         const spacings: number[] = [];
         for (let i = 1; i < Math.min(5, lines.length); i++) {
@@ -875,7 +899,7 @@ export default function PdfTextEditorClean({
           const prevLineBottom = Math.max(...prevLine.map(e => e.y + e.height));
           const currLineTop = Math.min(...currLine.map(e => e.y));
           const gap = currLineTop - prevLineBottom;
-          if (gap > 0 && gap < 100) { // Reasonable line spacing
+          if (gap > 0 && gap < avgFontSize * 4) {
             spacings.push(gap);
           }
         }
@@ -884,110 +908,89 @@ export default function PdfTextEditorClean({
         }
       }
       
-      // If we couldn't calculate typical spacing, use font size based estimate
-      if (typicalLineSpacing === 0 && lines[0].length > 0) {
-        const avgFontSize = lines[0].reduce((sum, e) => sum + e.fontSize, 0) / lines[0].length;
-        typicalLineSpacing = avgFontSize * 1.2;
-      }
-      
-      // Log typical spacing for debugging
-      console.log('Paragraph detection - Typical line spacing:', typicalLineSpacing);
-      console.log('Total lines to process:', lines.length);
-      
       for (let i = 1; i < lines.length; i++) {
         const prevLine = lines[i - 1];
         const currLine = lines[i];
         
-        // Calculate metrics for paragraph detection
         const prevLineBottom = Math.max(...prevLine.map(e => e.y + e.height));
         const currLineTop = Math.min(...currLine.map(e => e.y));
-        const prevLineTop = Math.min(...prevLine.map(e => e.y));
         const lineGap = currLineTop - prevLineBottom;
         
-        // Check if lines are on the same Y level (same line, side by side)
-        const yDiff = Math.abs(prevLineTop - currLineTop);
-        const sameYLevel = yDiff < 3; // Within 3px = same line
-        
-        // Calculate horizontal positions
         const prevLineLeft = Math.min(...prevLine.map(e => e.x));
         const prevLineRight = Math.max(...prevLine.map(e => e.x + e.width));
         const currLineLeft = Math.min(...currLine.map(e => e.x));
         const currLineRight = Math.max(...currLine.map(e => e.x + e.width));
         
-        // Check horizontal separation (if on same line or close)
+        // Check horizontal positioning
+        const leftAlignmentDiff = Math.abs(prevLineLeft - currLineLeft);
         const horizontalGap = currLineLeft - prevLineRight;
-        const horizontalOverlap = prevLineRight > currLineLeft && currLineRight > prevLineLeft;
-        const isSideBySide = sameYLevel && horizontalGap > 20; // Same line but far apart horizontally
-        const isSeparateColumns = sameYLevel && !horizontalOverlap && horizontalGap > 10; // Different columns
         
-        // Get average font size from both lines
+        // Check vertical overlap - if lines overlap vertically, they might be in same column
+        const prevLineTop = Math.min(...prevLine.map(e => e.y));
+        const currLineBottom = Math.max(...currLine.map(e => e.y + e.height));
+        const verticalOverlap = Math.min(prevLineBottom, currLineBottom) - Math.max(prevLineTop, currLineTop);
+        const hasVerticalOverlap = verticalOverlap > 0;
+        
+        // Very strict condition: Only group if next line is directly below with NO gap or minimal gap
+        // Use absolute pixel threshold - normal line spacing within paragraph is usually 2-5px
+        // Any gap larger than 5px is likely a paragraph break
+        const ABSOLUTE_GAP_THRESHOLD = 5; // pixels
+        
+        // Only group if gap is <= 5 pixels (very tight, normal line spacing)
+        // This ensures we only group lines that are truly directly connected
+        const isTightSpacing = lineGap <= ABSOLUTE_GAP_THRESHOLD;
+        
+        // Check if it's a different column (side-by-side paragraphs):
+        // Be very strict - if there's significant horizontal separation, break even if vertical gap is small
+        // This prevents items from different columns from being grouped together
+        const isDifferentColumn = horizontalGap > 60 || // Large horizontal gap (different column)
+                                  (leftAlignmentDiff > 60 && horizontalGap > 30) || // Misaligned and separated
+                                  (horizontalGap > 40 && leftAlignmentDiff > 40); // Both horizontal gap and misalignment
+        
+        // Also check if font size is very different (likely a heading)
         const prevAvgFontSize = prevLine.reduce((sum, e) => sum + e.fontSize, 0) / prevLine.length;
         const currAvgFontSize = currLine.reduce((sum, e) => sum + e.fontSize, 0) / currLine.length;
+        const fontSizeRatio = Math.max(prevAvgFontSize, currAvgFontSize) / Math.min(prevAvgFontSize, currAvgFontSize);
+        const isHeading = fontSizeRatio > 1.5;
         
-        // Check if font sizes are the same (within 5% tolerance)
-        const fontSizeDiff = Math.abs(prevAvgFontSize - currAvgFontSize) / Math.max(prevAvgFontSize, currAvgFontSize);
-        const sameFontSize = fontSizeDiff < 0.05; // Within 5% = same font size
+        // Only group if:
+        // 1. Gap is very tight (<=5px) - meaning lines are directly connected, AND
+        // 2. Not a different column, AND
+        // 3. Not a heading
+        // Otherwise, break into new paragraph
+        const isParagraphBreak = !isTightSpacing || isDifferentColumn || isHeading;
         
-        // Check if spacing is sequential (normal line spacing within paragraph)
-        // Sequential spacing = gap is close to typical spacing (within 30% tolerance)
-        const spacingRatio = typicalLineSpacing > 0 ? lineGap / typicalLineSpacing : 0;
-        const isSequentialSpacing = spacingRatio >= 0.7 && spacingRatio <= 1.5; // Normal line spacing
-        
-        // Paragraph break conditions:
-        // 1. Different font size = always break (edit separately)
-        // 2. Large gap (more than 1.5x typical spacing) = break (paragraph break)
-        // 3. Negative gap (overlap) = break (different element)
-        // 4. Same line but side by side (horizontal separation) = break (different paragraphs)
-        // 5. Separate columns on same line = break (different paragraphs)
-        const hasLargeGap = lineGap > typicalLineSpacing * 1.5;
-        const hasOverlap = lineGap < 0;
-        
-        // Break paragraph if:
-        // - Font sizes are different (even slightly), OR
-        // - Gap is too large (not sequential spacing), OR
-        // - There's overlap, OR
-        // - Same line but horizontally separated (side by side paragraphs)
-        const isParagraphBreak = !sameFontSize || hasLargeGap || hasOverlap || isSideBySide || isSeparateColumns;
-        
-        // Log first 10 line comparisons for debugging
-        if (i <= 10) {
-          const prevText = prevLine.map(e => e.text.substring(0, 20)).join(' ');
-          const currText = currLine.map(e => e.text.substring(0, 20)).join(' ');
-          console.log(`Line ${i-1} -> ${i}:`, {
-            prevText: prevText.substring(0, 40),
-            currText: currText.substring(0, 40),
-            prevFontSize: prevAvgFontSize.toFixed(2),
-            currFontSize: currAvgFontSize.toFixed(2),
-            sameFontSize,
-            sameYLevel,
-            horizontalGap: horizontalGap.toFixed(2),
-            isSideBySide,
-            isSeparateColumns,
-            lineGap: lineGap.toFixed(2),
-            typicalSpacing: typicalLineSpacing.toFixed(2),
-            spacingRatio: spacingRatio.toFixed(2),
-            isSequentialSpacing,
-            hasLargeGap,
-            isParagraphBreak,
-            breakReason: !sameFontSize ? 'differentFontSize' : isSideBySide ? 'sideBySide' : isSeparateColumns ? 'separateColumns' : hasLargeGap ? 'largeGap' : hasOverlap ? 'overlap' : 'sameParagraph'
-          });
-        }
+        // Debug logging for all comparisons
+        console.log(`Line ${i-1} -> ${i} comparison:`, {
+          lineGap: lineGap.toFixed(2),
+          threshold: ABSOLUTE_GAP_THRESHOLD,
+          isTightSpacing,
+          horizontalGap: horizontalGap.toFixed(2),
+          verticalOverlap: verticalOverlap.toFixed(2),
+          hasVerticalOverlap,
+          leftAlignmentDiff: leftAlignmentDiff.toFixed(2),
+          isDifferentColumn,
+          fontSizeRatio: fontSizeRatio.toFixed(2),
+          isHeading,
+          isParagraphBreak,
+          breakReason: !isTightSpacing ? 'gapTooLarge' : isDifferentColumn ? 'differentColumn' : isHeading ? 'heading' : 'sameParagraph'
+        });
         
         if (isParagraphBreak) {
-          // Start new paragraph
           paragraphs.push(currentParagraph);
           currentParagraph = [...currLine];
         } else {
-          // Continue current paragraph
+          // No significant gap = same paragraph, continue grouping
           currentParagraph.push(...currLine);
         }
       }
       
-      console.log(`Paragraph detection complete: ${paragraphs.length + 1} paragraphs found from ${lines.length} lines`);
-      
       if (currentParagraph.length > 0) {
         paragraphs.push(currentParagraph);
       }
+      
+      console.log(`Grouped ${sorted.length} items into ${lines.length} lines, then into ${paragraphs.length} paragraphs`);
+
 
       // Convert paragraphs to TextElement objects
       const grouped: TextElement[] = [];
@@ -1008,6 +1011,21 @@ export default function PdfTextEditorClean({
         const maxX = Math.max(...paragraph.map(e => e.x + e.width));
         const minY = Math.min(...paragraph.map(e => e.y));
         const maxY = Math.max(...paragraph.map(e => e.y + e.height));
+        
+        // Safety check: If paragraph spans too wide (likely different columns), split it
+        // Check if any item is significantly separated horizontally from others
+        const paragraphWidth = maxX - minX;
+        const avgItemWidth = paragraph.reduce((sum, e) => sum + e.width, 0) / paragraph.length;
+        
+        // If paragraph width is much larger than average item width, it might span columns
+        // Split into separate items if width > 3x average item width
+        if (paragraphWidth > avgItemWidth * 3 && paragraph.length > 1) {
+          // Split paragraph - treat each item separately
+          for (const item of paragraph) {
+            grouped.push(item);
+          }
+          continue;
+        }
 
         // Combine text intelligently
         const combinedText = paragraph
@@ -1254,15 +1272,17 @@ export default function PdfTextEditorClean({
             height: `${actualPageHeight * scale}px`,
             margin: '0 auto',
             minHeight: '100px',
-            backgroundColor: '#ffffff', // Fallback white background
+            backgroundColor: pageBackgroundImage ? 'transparent' : '#ffffff', // Only use white if no background image
             backgroundImage: pageBackgroundImage ? `url(${pageBackgroundImage})` : 'none',
             // CRITICAL: backgroundSize must match the container size exactly
             // The background image is rendered at actualPageWidth x actualPageHeight
             // So we scale it to match the scaled container
-            backgroundSize: `${actualPageWidth * scale}px ${actualPageHeight * scale}px`,
+            backgroundSize: pageBackgroundImage ? `${actualPageWidth * scale}px ${actualPageHeight * scale}px` : 'auto',
             backgroundPosition: '0 0', // Top-left, no offset
             backgroundRepeat: 'no-repeat',
             border: 'none',
+            // Ensure background covers entire area
+            backgroundAttachment: 'local',
           }}
         >
           
@@ -1473,31 +1493,7 @@ function EditableTextElement({
     })(),
     backgroundColor: isFocused 
       ? 'rgba(255, 255, 0, 0.3)' // Yellow highlight when focused
-      : (() => {
-          // Only use extracted background color if it's from CSS styles and clearly a background
-          // Canvas sampling is disabled, so any backgroundColor is from CSS computed styles
-          const bg = element.backgroundColor;
-          if (!bg || bg.includes('transparent') || bg === 'rgba(0, 0, 0, 0)') {
-            return 'transparent';
-          }
-          
-          // Validate it's a reasonable background color (light/colored, not dark text)
-          const rgbMatch = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-          if (rgbMatch) {
-            const r = parseInt(rgbMatch[1]);
-            const g = parseInt(rgbMatch[2]);
-            const b = parseInt(rgbMatch[3]);
-            
-            // Only use if it's light enough to be a background (not dark text)
-            // This preserves CSS-set backgrounds like pink boxes, yellow highlights
-            if (r + g + b < 300) {
-              // Too dark - likely text color, not background
-              return 'transparent';
-            }
-          }
-          
-          return bg;
-        })(),
+      : 'transparent', // Always transparent when not focused - background image shows through
     border: isFocused ? '2px solid #0066cc' : 'none', // Only show border when focused
     padding: '2px 4px', // Reduced padding to prevent truncation
     margin: 0,
