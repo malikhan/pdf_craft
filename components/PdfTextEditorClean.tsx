@@ -62,6 +62,8 @@ export default function PdfTextEditorClean({
   const containerRef = useRef<HTMLDivElement>(null);
   const pdfViewerRef = useRef<HTMLDivElement>(null);
   const onTextChangeRef = useRef(onTextChange);
+  const extractedPageRef = useRef<number | null>(null); // Track which page has been extracted
+  const userEditsRef = useRef<Map<string, string>>(new Map()); // Persistent map of user edits by element ID
   
   // Debug: Log state changes
   useEffect(() => {
@@ -115,10 +117,26 @@ export default function PdfTextEditorClean({
       console.log('No PDF file, clearing elements');
       setTextElements([]);
       setImageElements([]);
+      extractedPageRef.current = null;
+      userEditsRef.current.clear(); // Clear persistent edits when PDF is cleared
       return;
     }
 
+    // Only extract if page changed (extractedPageRef will be different)
+    // This prevents re-extraction when user edits trigger re-renders
+    if (extractedPageRef.current === currentPage) {
+      console.log(`Skipping extraction for page ${currentPage} - already extracted`);
+      return;
+    }
+
+    // Clear persistent edits when page changes (edits are page-specific)
+    if (extractedPageRef.current !== null && extractedPageRef.current !== currentPage) {
+      console.log(`Clearing persistent edits for page change: ${extractedPageRef.current} -> ${currentPage}`);
+      userEditsRef.current.clear();
+    }
+
     console.log('Starting extraction for page:', currentPage);
+    extractedPageRef.current = currentPage;
     setIsExtracting(true);
 
     const extractText = async () => {
@@ -753,13 +771,48 @@ export default function PdfTextEditorClean({
         setExtractedPageHeight(pdfPageRect.height);
         
         console.log('Setting text elements and images...');
-        setTextElements(groupedElements);
+        // CRITICAL: Preserve user edits when re-extracting
+        // Merge extracted elements with existing user edits using persistent edit map
+        let mergedElements: TextElement[] = groupedElements; // Default to extracted elements
+        setTextElements(prev => {
+          console.log(`Merging: prev has ${prev.length} elements, extracted has ${groupedElements.length} elements`);
+          console.log(`[MERGE] Persistent edits map has ${userEditsRef.current.size} stored edits`);
+          
+          // Check if any persistent edits are missing from extracted elements
+          userEditsRef.current.forEach((edit, id) => {
+            const found = groupedElements.find(el => el.id === id);
+            if (!found) {
+              console.warn(`[MERGE] WARNING: Element ${id} has persistent edit "${edit.substring(0, 30) || '(empty)'}" but is missing from extracted elements!`);
+            }
+          });
+          
+          // Use persistent edit map - this survives element recreation
+          // Merge: use user edits from persistent map if they exist, otherwise use extracted text
+          mergedElements = groupedElements.map(el => {
+            const userEdit = userEditsRef.current.get(el.id);
+            if (userEdit !== undefined) {
+              // Preserve user's edit from persistent map (including empty string if user deleted everything)
+              const editPreview = userEdit.length > 0 ? userEdit.substring(0, 30) : '(empty)';
+              const extractedPreview = el.text.length > 0 ? el.text.substring(0, 30) : '(empty)';
+              console.log(`[MERGE] Preserving persistent user edit for ${el.id}: "${editPreview}" (extracted would be: "${extractedPreview}")`);
+              return { ...el, text: userEdit };
+            }
+            return el;
+          });
+          
+          return mergedElements;
+        });
         setImageElements(images);
         console.log('State set, setting isExtracting to false');
         setIsExtracting(false);
+        // Call the callback with merged elements after state update (outside of setState)
         setTimeout(() => {
-          console.log('Calling onTextChange with', groupedElements.length, 'elements');
-          onTextChangeRef.current(groupedElements);
+          if (mergedElements && mergedElements.length > 0) {
+            console.log('Calling onTextChange with', mergedElements.length, 'elements');
+            onTextChangeRef.current(mergedElements);
+          } else {
+            console.warn('mergedElements is undefined or empty, skipping onTextChange callback');
+          }
         }, 0);
       } catch (error) {
         console.error('Error extracting text:', error);
@@ -839,11 +892,36 @@ export default function PdfTextEditorClean({
         const groupedElements = groupTextItems(elements);
         console.log(`Fallback: Grouped into ${groupedElements.length} elements`);
         
-        setTextElements(groupedElements);
+        // CRITICAL: Preserve user edits when re-extracting (fallback path)
+        // Use persistent edit map - this survives element recreation
+        let mergedElements: TextElement[] = groupedElements; // Default to extracted elements
+        setTextElements(prev => {
+          console.log(`[FALLBACK MERGE] prev has ${prev.length} elements, extracted has ${groupedElements.length} elements`);
+          console.log(`[FALLBACK MERGE] Persistent edits map has ${userEditsRef.current.size} stored edits`);
+          
+          // Merge: use user edits from persistent map if they exist, otherwise use extracted text
+          mergedElements = groupedElements.map(el => {
+            const userEdit = userEditsRef.current.get(el.id);
+            if (userEdit !== undefined) {
+              const editPreview = userEdit.length > 0 ? userEdit.substring(0, 30) : '(empty)';
+              const extractedPreview = el.text.length > 0 ? el.text.substring(0, 30) : '(empty)';
+              console.log(`[FALLBACK MERGE] Preserving persistent user edit for ${el.id}: "${editPreview}" (extracted would be: "${extractedPreview}")`);
+              return { ...el, text: userEdit };
+            }
+            return el;
+          });
+          
+          return mergedElements;
+        });
         setImageElements(images);
         setIsExtracting(false);
+        // Call the callback with merged elements after state update (outside of setState)
         setTimeout(() => {
-          onTextChangeRef.current(groupedElements);
+          if (mergedElements && mergedElements.length > 0) {
+            onTextChangeRef.current(mergedElements);
+          } else {
+            console.warn('Fallback: mergedElements is undefined or empty, skipping onTextChange callback');
+          }
         }, 0);
       } catch (error) {
         console.error('Error in fallback extraction:', error);
@@ -1124,17 +1202,93 @@ export default function PdfTextEditorClean({
 
   // Handle text changes
   const handleTextChange = useCallback((id: string, text: string) => {
+    let updatedElements: TextElement[] | undefined;
+    let originalText: string | undefined;
+    
     setTextElements(prev => {
-      const updated = prev.map(el => 
+      // Find the original element from prev state (more reliable than textElements)
+      const originalElement = prev.find(el => el.id === id);
+      originalText = originalElement?.originalText;
+      
+      // CRITICAL: Store user edit in persistent map - this survives element recreation
+      if (originalElement) {
+        // Only store if it's different from original (user actually edited)
+        // IMPORTANT: Empty string is a valid edit - user deleted everything
+        if (text !== originalElement.originalText) {
+          userEditsRef.current.set(id, text);
+          const textPreview = text.length > 0 ? text.substring(0, 30) : '(empty)';
+          const origPreview = originalElement.originalText.length > 0 ? originalElement.originalText.substring(0, 30) : '(empty)';
+          console.log(`[PERSISTENT EDIT] Storing edit for ${id}: "${textPreview}" (original: "${origPreview}")`);
+        } else {
+          // If user restored to original, remove from edits map
+          userEditsRef.current.delete(id);
+          console.log(`[PERSISTENT EDIT] Removing edit for ${id} (restored to original)`);
+        }
+      } else {
+        // Element not found in prev - might be a new element, but still store the edit
+        // This handles edge cases where element might not be in state yet
+        userEditsRef.current.set(id, text);
+        console.log(`[PERSISTENT EDIT] Storing edit for ${id} (element not in state): "${text.substring(0, 30) || '(empty)'}"`);
+      }
+      
+      updatedElements = prev.map(el => 
         el.id === id ? { ...el, text } : el
       );
-      // Use ref to avoid dependency issues
-      setTimeout(() => {
-        onTextChangeRef.current(updated);
-      }, 100);
-      return updated;
+      return updatedElements;
     });
+    
+    // Call callback outside of setState to avoid render warning
+    setTimeout(() => {
+      if (updatedElements && updatedElements.length > 0) {
+        onTextChangeRef.current(updatedElements);
+      } else {
+        console.warn('handleTextChange: updatedElements is undefined or empty, skipping callback');
+      }
+    }, 100);
   }, []);
+
+  // CRITICAL: Ensure textElements always reflect persistent edits
+  // This runs whenever textElements changes and applies any missing persistent edits
+  useEffect(() => {
+    if (textElements.length === 0 || userEditsRef.current.size === 0) {
+      return; // Nothing to sync
+    }
+
+    // Debug: Log all persistent edits and check for text-6 specifically
+    console.log(`[SYNC CHECK] textElements: ${textElements.length}, persistent edits: ${userEditsRef.current.size}`);
+    userEditsRef.current.forEach((edit, id) => {
+      const element = textElements.find(el => el.id === id);
+      if (element) {
+        console.log(`[SYNC CHECK] ${id}: persistent="${edit.substring(0, 30) || '(empty)'}", current="${element.text.substring(0, 30) || '(empty)'}", match=${edit === element.text}`);
+      } else {
+        console.log(`[SYNC CHECK] ${id}: persistent="${edit.substring(0, 30) || '(empty)'}", element NOT FOUND in textElements`);
+      }
+    });
+
+    // Check if any elements need their persistent edits applied
+    const needsUpdate = textElements.some(el => {
+      const persistentEdit = userEditsRef.current.get(el.id);
+      return persistentEdit !== undefined && el.text !== persistentEdit;
+    });
+
+    if (needsUpdate) {
+      console.log('[SYNC] Applying persistent edits to textElements state');
+      setTextElements(prev => {
+        let hasChanges = false;
+        const updated = prev.map(el => {
+          const persistentEdit = userEditsRef.current.get(el.id);
+          if (persistentEdit !== undefined && el.text !== persistentEdit) {
+            hasChanges = true;
+            console.log(`[SYNC] Updating ${el.id} from "${el.text.substring(0, 30) || '(empty)'}" to "${persistentEdit.substring(0, 30) || '(empty)'}"`);
+            return { ...el, text: persistentEdit };
+          }
+          return el;
+        });
+        // Only return new array if there were actual changes to prevent infinite loop
+        return hasChanges ? updated : prev;
+      });
+    }
+  }, [textElements]);
 
   // Use extracted dimensions if available, otherwise use props
   const actualPageWidth = extractedPageWidth || pageWidth || 612;
@@ -1308,9 +1462,16 @@ export default function PdfTextEditorClean({
           
           {/* Editable text elements - clean editor without PDF background */}
           {textElements.map((element, index) => {
+            // CRITICAL: Apply persistent edit if it exists - ensures user edits survive any state updates
+            const persistentEdit = userEditsRef.current.get(element.id);
+            const displayElement = persistentEdit !== undefined 
+              ? { ...element, text: persistentEdit }
+              : element;
+            
             console.log(`Rendering element ${index}:`, {
               id: element.id,
-              text: element.text.substring(0, 30),
+              text: displayElement.text.substring(0, 30),
+              hasPersistentEdit: persistentEdit !== undefined,
               x: element.x,
               y: element.y,
               scaledX: element.x * scale,
@@ -1321,7 +1482,7 @@ export default function PdfTextEditorClean({
             return (
               <EditableTextElement
                 key={element.id}
-                element={element}
+                element={displayElement}
                 scale={scale}
                 onTextChange={handleTextChange}
               />
@@ -1357,30 +1518,272 @@ function EditableTextElement({
   const [isFocused, setIsFocused] = useState(false);
   const [value, setValue] = useState(element.text || '');
   const inputRef = useRef<HTMLTextAreaElement>(null);
-
-  // Update value when element changes
+  const isUserEditingRef = useRef(false);
+  const lastUserValueRef = useRef<string>(element.text || '');
+  const hasUserEditedRef = useRef(false); // Track if user has ever edited this element
+  
+  // Track if this is the initial mount or if element changed
+  const isInitialMountRef = useRef(true);
+  const lastElementIdRef = useRef<string>(element.id);
+  
+  // Reset when element ID changes (e.g., page switch or re-extraction)
+  useEffect(() => {
+    if (lastElementIdRef.current !== element.id) {
+      // Element changed - reset everything
+      const initialValue = element.text || '';
+      setValue(initialValue);
+      lastUserValueRef.current = initialValue;
+      isInitialMountRef.current = true;
+      lastElementIdRef.current = element.id;
+      isUserEditingRef.current = false;
+      hasUserEditedRef.current = false; // Reset edit flag for new element
+    }
+  }, [element.id, element.text]);
+  
+  // Update value when element changes, but only if user is not actively editing
+  // This prevents overwriting user's deletions
   useEffect(() => {
     const newValue = element.text || '';
-    console.log(`EditableTextElement: Updating value for ${element.id}:`, {
-      oldValue: value.substring(0, 30),
-      newValue: newValue.substring(0, 30),
-      newValueLength: newValue.length
-    });
-    setValue(newValue);
-  }, [element.text, element.id]);
+    const currentValue = value || '';
+    
+    // Debug log to trace the issue
+    if (element.id === 'text-6') {
+      console.log(`[DEBUG text-6] useEffect triggered:`, {
+        newValue: newValue.substring(0, 30) || '(empty)',
+        newLength: newValue.length,
+        currentValue: currentValue.substring(0, 30) || '(empty)',
+        currentLength: currentValue.length,
+        isFocused,
+        isUserEditing: isUserEditingRef.current,
+        hasUserEdited: hasUserEditedRef.current,
+        lastUserValue: lastUserValueRef.current.substring(0, 30) || '(empty)',
+        isInitialMount: isInitialMountRef.current
+      });
+    }
+    
+    // On initial mount, sync with element.text
+    // BUT: If element.text is empty and we have a persistent edit that's also empty, that's correct
+    // If element.text is NOT empty but we expect it to be empty (from persistent edit), we need to check
+    if (isInitialMountRef.current) {
+      const initialValue = element.text || '';
+      setValue(initialValue);
+      // CRITICAL: If element.text is empty, user likely deleted it - set lastUserValueRef to empty
+      // This ensures we block any future restorations
+      if (initialValue.length === 0) {
+        lastUserValueRef.current = '';
+        hasUserEditedRef.current = true; // Mark as edited since user deleted it
+        console.log(`EditableTextElement: [INIT] Initializing ${element.id} with empty value (user deleted)`);
+      } else {
+        lastUserValueRef.current = initialValue;
+      }
+      isInitialMountRef.current = false;
+      return;
+    }
+    
+    const originalText = element.originalText || '';
+    
+    // CRITICAL: If newValue is empty (from persistent edit confirming deletion), accept it immediately
+    // This must happen BEFORE all other checks to ensure deletions are synced properly
+    if (newValue.length === 0) {
+      // If newValue is empty, it means persistent edit confirms deletion
+      // We should sync it if:
+      // 1. User deleted it (lastUserValueRef is empty) - ALWAYS sync, even if focused
+      // 2. Value state is not empty (needs sync) AND we're not actively editing
+      const userDeletedIt = lastUserValueRef.current.length === 0;
+      const valueNeedsSync = currentValue.length > 0; // value state is not empty but should be
+      const notActivelyEditing = !isUserEditingRef.current && !isFocused;
+      
+      // CRITICAL: If user deleted it, always sync (even if focused - user might have deleted and blurred)
+      // OR if value needs sync and we're not actively editing
+      if (userDeletedIt || (valueNeedsSync && notActivelyEditing)) {
+        console.log(`EditableTextElement: [CRITICAL] Accepting empty sync for ${element.id} (persistent edit confirms deletion):`, {
+          currentValue: currentValue.substring(0, 30) || '(empty)',
+          currentLength: currentValue.length,
+          newValue: '(empty)',
+          lastUserValue: lastUserValueRef.current.substring(0, 30) || '(empty)',
+          lastUserValueLength: lastUserValueRef.current.length,
+          isUserEditing: isUserEditingRef.current,
+          hasUserEdited: hasUserEditedRef.current,
+          isFocused: isFocused,
+          userDeletedIt,
+          valueNeedsSync,
+          notActivelyEditing,
+          reason: 'Persistent edit is empty - accepting deletion confirmation (BEFORE all other checks)'
+        });
+        setValue('');
+        lastUserValueRef.current = '';
+        isUserEditingRef.current = false; // Clear editing flag since we're syncing
+        hasUserEditedRef.current = true; // Ensure this is set
+        return;
+      }
+    }
+    
+    // Don't update if user is currently editing (focused or recently edited)
+    // BUT we already handled empty syncs above (even when focused), so this is safe
+    if (isFocused || isUserEditingRef.current) {
+      return;
+    }
+    
+    // CRITICAL: If user deleted text (lastUserValueRef is empty), NEVER accept original back
+    // This is the most important check - if user intentionally deleted, keep it deleted
+    if (lastUserValueRef.current.length === 0 && newValue.length > 0 && newValue === originalText) {
+      console.log(`EditableTextElement: [CRITICAL] BLOCKING restore to original for ${element.id} (user deleted it):`, {
+        currentValue: currentValue.substring(0, 30) || '(empty)',
+        currentLength: currentValue.length,
+        newValue: newValue.substring(0, 30) || '(empty)',
+        originalText: originalText.substring(0, 30) || '(empty)',
+        lastUserValue: lastUserValueRef.current.substring(0, 30) || '(empty)',
+        reason: 'User deleted text - blocking any restore to original'
+      });
+      return;
+    }
+    
+    // CRITICAL: If current value differs from original, NEVER accept original back
+    // This catches cases where user has edited but hasUserEditedRef might not be set yet
+    if (currentValue !== originalText && newValue === originalText) {
+      console.log(`EditableTextElement: BLOCKING restore to original for ${element.id}:`, {
+        currentValue: currentValue.substring(0, 30) || '(empty)',
+        newValue: newValue.substring(0, 30) || '(empty)',
+        originalText: originalText.substring(0, 30) || '(empty)',
+        reason: 'Current value differs from original - blocking restore'
+      });
+      return;
+    }
+    
+    // CRITICAL: If user has ever edited this element, be very strict about updates
+    // Only accept updates that exactly match what we sent to parent
+    if (hasUserEditedRef.current) {
+      // If new value matches what we sent, it's a legitimate sync - allow it
+      if (newValue === lastUserValueRef.current) {
+        console.log(`EditableTextElement: Accepting sync for ${element.id} (matches last sent value)`);
+        setValue(newValue);
+        return;
+      }
+      
+      // If new value matches original and current doesn't, it's a reset attempt - BLOCK IT
+      // (Empty syncs are already handled earlier, before this block)
+      if (newValue === originalText && currentValue !== originalText) {
+        console.log(`EditableTextElement: BLOCKING reset attempt for ${element.id} (trying to restore original):`, {
+          currentValue: currentValue.substring(0, 30) || '(empty)',
+          newValue: newValue.substring(0, 30) || '(empty)',
+          originalText: originalText.substring(0, 30) || '(empty)',
+          lastUserValue: lastUserValueRef.current.substring(0, 30) || '(empty)',
+          reason: 'User has edited - blocking restore to original'
+        });
+        return;
+      }
+      
+      // Any other mismatch - user has unsaved changes, keep user's version
+      console.log(`EditableTextElement: BLOCKING update for ${element.id} (user has edited, value mismatch):`, {
+        currentValue: currentValue.substring(0, 30) || '(empty)',
+        currentLength: currentValue.length,
+        newValue: newValue.substring(0, 30) || '(empty)',
+        newLength: newValue.length,
+        lastUserValue: lastUserValueRef.current.substring(0, 30) || '(empty)',
+        reason: 'User has edited this element - only accepting exact matches'
+      });
+      // NEVER update - user has edited, only accept exact matches
+      return;
+    }
+    
+    // CRITICAL: If user has deleted all text (empty), NEVER accept a non-empty value from parent
+    // Check both currentValue and lastUserValueRef - if either indicates deletion, block restore
+    const userDeletedText = currentValue.length === 0 || lastUserValueRef.current.length === 0;
+    if (userDeletedText && newValue.length > 0) {
+      console.log(`EditableTextElement: [CRITICAL] BLOCKING reset attempt for ${element.id} (user deleted all text):`, {
+        currentValue: currentValue.substring(0, 30) || '(empty)',
+        currentLength: currentValue.length,
+        newValue: newValue.substring(0, 30),
+        newLength: newValue.length,
+        lastUserValue: lastUserValueRef.current.substring(0, 30) || '(empty)',
+        lastUserValueLength: lastUserValueRef.current.length,
+        reason: 'User deleted all text (checked both currentValue and lastUserValueRef) - blocking any restore attempt'
+      });
+      // NEVER update - user intentionally deleted everything
+      // Also ensure value stays empty if it was reset
+      if (currentValue.length > 0 && lastUserValueRef.current.length === 0) {
+        console.log(`EditableTextElement: [CRITICAL] Restoring empty value for ${element.id} (lastUserValueRef indicates deletion)`);
+        setValue('');
+      }
+      return;
+    }
+    
+    // CRITICAL: Only update if the new value EXACTLY matches what we last sent to parent
+    // This ensures we only accept legitimate syncs, not resets
+    // If newValue !== lastUserValueRef.current, it means either:
+    // 1. User made changes that haven't been synced yet (keep user's value)
+    // 2. Parent is trying to reset (ignore it, keep user's value)
+    if (newValue !== currentValue) {
+      // Special case: If user has made the text shorter, and parent is trying to make it longer,
+      // this is definitely a reset attempt - ignore it
+      if (currentValue.length < newValue.length && newValue !== lastUserValueRef.current) {
+        console.log(`EditableTextElement: BLOCKING reset attempt for ${element.id} (text grew unexpectedly):`, {
+          currentValue: currentValue.substring(0, 30) || '(empty)',
+          currentLength: currentValue.length,
+          newValue: newValue.substring(0, 30),
+          newLength: newValue.length,
+          lastUserValue: lastUserValueRef.current.substring(0, 30) || '(empty)',
+          reason: 'User deleted text, parent trying to restore'
+        });
+        // Don't update - keep user's current (shorter) value
+        return;
+      }
+      
+      if (newValue === lastUserValueRef.current) {
+        // This is a legitimate sync - the parent is reflecting back what we sent
+        console.log(`EditableTextElement: Syncing value for ${element.id}:`, {
+          oldValue: currentValue.substring(0, 30) || '(empty)',
+          newValue: newValue.substring(0, 30) || '(empty)',
+          lastUserValue: lastUserValueRef.current.substring(0, 30) || '(empty)'
+        });
+        setValue(newValue);
+      } else {
+        // Parent value doesn't match what we sent - user has unsaved changes or parent is resetting
+        // Keep the user's current value
+        console.log(`EditableTextElement: Ignoring update for ${element.id} (value mismatch):`, {
+          currentValue: currentValue.substring(0, 30) || '(empty)',
+          currentLength: currentValue.length,
+          newValue: newValue.substring(0, 30) || '(empty)',
+          newLength: newValue.length,
+          lastUserValue: lastUserValueRef.current.substring(0, 30) || '(empty)',
+          reason: 'Value mismatch - keeping user\'s version'
+        });
+        // Don't update - keep user's current value
+      }
+    }
+  }, [element.text, element.id, isFocused, value]);
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newValue = e.target.value;
     setValue(newValue);
+    // CRITICAL: Update lastUserValueRef immediately and synchronously
+    // This ensures it's set before any parent updates can happen
+    lastUserValueRef.current = newValue; // Track what user is typing (including empty string)
+    isUserEditingRef.current = true; // Mark that user is actively editing
+    hasUserEditedRef.current = true; // Mark that user has edited this element (permanently)
     onTextChange(element.id, newValue);
+    
+    // Clear the editing flag after a longer delay to prevent race conditions
+    // Especially important when deleting - need time for parent to process
+    setTimeout(() => {
+      if (!isFocused) {
+        isUserEditingRef.current = false;
+      }
+    }, 300); // Increased from 100ms to 300ms
   };
 
   const handleBlur = () => {
     setIsFocused(false);
+    // Keep editing flag active longer after blur to prevent immediate resets
+    // This is especially important when user just deleted text
+    setTimeout(() => {
+      isUserEditingRef.current = false;
+    }, 500); // Increased from 200ms to 500ms to give more time
   };
 
   const handleFocus = () => {
     setIsFocused(true);
+    isUserEditingRef.current = true;
   };
 
   const isMultiline = element.height > element.fontSize * 1.5;
@@ -1515,8 +1918,10 @@ function EditableTextElement({
     display: 'block' as const,
   };
 
-  // Ensure value is not empty - use element.text as fallback
-  const displayValue = value || element.text || element.originalText || '';
+  // CRITICAL: Use value state first, then element.text (from persistent edit)
+  // DO NOT fallback to originalText - if user deleted it, keep it empty!
+  // If both value and element.text are empty, that means user deleted it - keep it empty
+  const displayValue = value !== undefined && value !== null ? value : (element.text || '');
   
   console.log(`EditableTextElement render:`, {
     id: element.id,
